@@ -1,29 +1,45 @@
-name: Audit
+name: Windows bin removal validation (fork only)
 
 on:
   push:
-    # Skip the redundant run on the merge queue's temporary
-    # `gh-readonly-queue/**` branches; the pull_request run already covered it.
-    branches-ignore:
-      - 'gh-readonly-queue/**'
-  pull_request:
+    branches: ['test/windows-bin-removal-14549']
 
 permissions:
-  contents: read # to fetch code (actions/checkout)
+  contents: read
 
 jobs:
-  audit:
-    name: Audit dependencies
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-
+  native:
+    if: github.repository == 'zhsama/pnpm'
+    name: Windows / ${{ matrix.variant }}
+    runs-on: windows-2025
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [normal, no-retry, cleanup-bypass, replacement-bypass]
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 4
     steps:
-    - name: Checkout Commit
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        persist-credentials: false
-    - name: Install pnpm
-      uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
-      with:
-        install: false
-    - name: Audit
-      run: pn audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.97.0 --profile minimal
+      - name: Native tests and ablation assertions
+        run: node .github/scripts/validate-windows-bin-removal.mjs ${{ matrix.variant }}
+      - name: Test observation lifecycle
+        if: matrix.variant == 'normal'
+        run: |
+          cargo test --locked -p pnpm-fs --features test test_support:: -- --show-output
+      - name: Measure permanent directory error
+        if: matrix.variant == 'normal'
+        run: cargo test --locked -p pnpm-cmd-shim --test windows_directory_probe -- --show-output
+      - name: Upload native logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-${{ matrix.variant }}
+          path: .artifacts/windows-bin-removal/
+          include-hidden-files: true
+          if-no-files-found: warn
