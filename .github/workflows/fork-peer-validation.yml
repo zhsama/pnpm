@@ -1,0 +1,192 @@
+name: Fork tarball peer validation
+
+on:
+  push:
+    branches: ['chore/fork-peer-validation']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-peer-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: a82b3c1a7424b440a1c57f3494ee7f349dd3ab2c
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_BUILD_JOBS: '3'
+
+jobs:
+  checks:
+    if: github.repository == 'zhsama/pnpm'
+    name: ${{ matrix.check }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [tests, lint]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: ./.github/actions/rustup
+        with:
+          clippy: true
+          restore-cache: false
+      - uses: ./.github/actions/install-crates
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: just,cargo-nextest
+      - name: Test changed crates, CLI peers, and CLI smoke
+        if: matrix.check == 'tests'
+        shell: bash
+        run: |
+          unset PNPM_HOME XDG_DATA_HOME
+          pnpm exec cargo build --locked --bin pnpr
+          pnpm test:rust --locked -p pnpm-deps-inspection-peers -p pnpm-resolving-deps-resolver
+          pnpm test:rust --locked -p pnpm-cli -E 'test(/^peers::/) + test(/^local_tarball_dependency::/)'
+          pnpm test:rust-smoke --locked -p pnpm-cli
+      - name: Check and lint workspace
+        if: matrix.check == 'lint'
+        run: |
+          pnpm check:rust
+          pnpm lint:rust
+
+  build:
+    if: github.repository == 'zhsama/pnpm'
+    name: Release build (${{ matrix.revision }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [HEAD, main]
+    env:
+      REVISION: ${{ matrix.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.revision == 'main' && env.BASE_SHA || github.sha }}
+          persist-credentials: false
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: ./.github/actions/rustup
+        with:
+          restore-cache: false
+      - uses: ./.github/actions/install-crates
+      - name: Build release binaries with the committed release profile
+        run: |
+          if [ "$REVISION" = HEAD ]; then
+            pnpm build:pnpm --locked --bin pnpr --bin integrated-benchmark
+          else
+            pnpm build:pnpm --locked
+          fi
+      - name: Stage executable artifacts
+        shell: bash
+        run: |
+          release="bench-work-env/pacquet@$REVISION/pacquet/target/release"
+          mkdir -p "$release"
+          cp target/release/pnpm "$release/"
+          files=("$release/pnpm")
+          if [ "$REVISION" = HEAD ]; then
+            mkdir -p target/debug
+            cp target/release/integrated-benchmark target/debug/integrated-benchmark
+            files+=(target/debug/integrated-benchmark target/release/pnpr)
+          fi
+          git rev-parse HEAD > "revision-$REVISION.txt"
+          sha256sum target/release/pnpm > "binary-$REVISION.sha256"
+          tar -cf "revision-$REVISION.tar" "${files[@]}" "revision-$REVISION.txt" "binary-$REVISION.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-peer-binaries-${{ matrix.revision }}
+          path: revision-${{ matrix.revision }}.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  benchmark:
+    needs: build
+    name: Benchmark (${{ matrix.scenario }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - isolated-linker.peer-heavy-resolve.hot-cache.offline
+          - isolated-linker.linked-workspace-resolve.hot-cache.offline
+          - isolated-linker.fresh-resolve.hot-cache.offline
+    env:
+      SCENARIO: ${{ matrix.scenario }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pin the baseline label to the actual upstream base
+        run: |
+          git branch --force main "$BASE_SHA"
+          test "$(git rev-parse main)" = "$BASE_SHA"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: fork-peer-binaries-*
+          path: revision-binaries
+          merge-multiple: true
+      - name: Unpack and verify revisions
+        run: |
+          for archive in revision-binaries/*.tar; do
+            tar -xf "$archive"
+          done
+          test "$(cat revision-main.txt)" = "$BASE_SHA"
+          test "$(cat revision-HEAD.txt)" = "$GITHUB_SHA"
+          test -x bench-work-env/pacquet@HEAD/pacquet/target/release/pnpm
+          test -x bench-work-env/pacquet@main/pacquet/target/release/pnpm
+          test -x target/release/pnpr
+          test -x target/debug/integrated-benchmark
+      - uses: ./.github/actions/rustup
+        with:
+          restore-cache: false
+      - uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3.0.0
+        with:
+          install: false
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: just,hyperfine@1.18.0
+      - name: Prepare registry and benchmark dependencies
+        timeout-minutes: 15
+        run: just install
+      - name: Compare both revisions on the same runner
+        timeout-minutes: 35
+        run: |
+          node .github/scripts/run-integrated-benchmark.mjs \
+            --reuse-prebuilt-binaries --scenario="$SCENARIO" --runs=15 \
+            --registry=verdaccio --registry-latency-ms=50 --registry-bandwidth-mbps=200 \
+            pacquet@HEAD pacquet@main
+          node .github/scripts/fork-peer-comparison.mjs bench-work-env "$SCENARIO" >> "$GITHUB_STEP_SUMMARY"
+      - name: Collect raw measurements and revision evidence
+        if: always()
+        run: |
+          mkdir -p fork-peer-results
+          cp revision-*.txt binary-*.sha256 fork-peer-results/
+          for report in bench-work-env/BENCHMARK_REPORT.* bench-work-env/BENCHMARK_DIAGNOSTICS.*; do
+            if [ -f "$report" ]; then cp "$report" fork-peer-results/; fi
+          done
+          printf '%s\n' "$SCENARIO" > fork-peer-results/scenario.txt
+          uname -a > fork-peer-results/runner.txt
+          lscpu >> fork-peer-results/runner.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: fork-peer-results-${{ matrix.scenario }}
+          path: fork-peer-results/
+          if-no-files-found: error
+          retention-days: 14
